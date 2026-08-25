@@ -1,0 +1,130 @@
+  @startuml C2_Вариант1
+  !include https://raw.githubusercontent.com/plantuml-stdlib/C4-PlantUML/master/C4_Container.puml
+
+  title C2 - Вариант 1: "Автономная ферма, тонкий центр"
+
+  Person(operator, "Оператор фермы", "Дежурный")
+  Person(vet, "Ветеринарный врач", "Диагнозы")
+  Person(admin, "Администратор", "Настройка ферм")
+  Person(director, "Директор", "Сводки")
+
+  System_Ext(cameras, "IP-камеры", "ONVIF/RTSP")
+  System_Ext(feeders, "Кормушки и поилки", "Modbus и проприетарные протоколы")
+  System_Ext(water, "Станции водоподготовки", "Modbus TCP")
+  System_Ext(siren, "Сирена и табло", "Реле")
+  System_Ext(sms, "GSM/SMS-шлюз", "SMPP")
+
+  ' ============================================================
+  ' ФЕРМЕННЫЙ АГЕНТ - автономен, работает без интернета
+  ' ============================================================
+  System_Boundary(agent, "Ферменный агент (на КАЖДОЙ ферме)") {
+
+      Container(ingest, "Приём видеопотока", "Go + GStreamer", "RTSP от камер, декодирование, нарезка кадров. Адаптеры вендоров")
+      Container(inference, "Сервис инференса", "Python + Triton, GPU", "Исполняет ML-модели партнёра. Детекция драк, задавливания, поз")
+      Container(welfare, "Сервис благополучия", "Kotlin", "Превращает детекции в инциденты. Правила, пороги, подавление ложных срабатываний")
+      Container(counter, "Подсчёт поголовья", "Python", "Считает головы по кадрам, сверяет с ожидаемым")
+
+      Container(feeding, "Сервис кормления", "Go", "Расписания, дозы, учёт фактического расхода")
+      Container(wateragent, "Сервис водоподготовки", "Go", "Опрос фильтров, контроль качества воды")
+      Container(devadapter, "Адаптер оборудования", "Go", "Прячет протоколы вендоров за единым интерфейсом. Modbus, HTTP, проприетарные")
+
+      Container(notify, "Сервис оповещений", "Go", "Каналы, эскалация, подавление дублей, подтверждение получения")
+      Container(watchdog, "Сторожевой модуль", "C, отдельный контроллер", "Аварийная сирена при отказе основного сервера. Независим от него")
+
+      Container(localui, "Локальный веб-интерфейс", "React", "Работает по локальной сети без интернета")
+      Container(localapi, "Локальный API", "Kotlin + Spring", "REST/WebSocket для локального UI")
+
+      Container(sync, "Сервис синхронизации", "Go", "Transactional outbox, докачка после обрыва, идемпотентность")
+
+      ContainerQueue(mqtt, "Локальная шина", "RabbitMQ + MQTT", "Обмен между сервисами агента. MQTT для устройств")
+      ContainerDb(localdb, "Локальная БД", "PostgreSQL + TimescaleDB", "События, инциденты, телеметрия. Буфер на время обрыва")
+      ContainerDb(localblob, "Локальное хранилище", "MinIO", "Видеофрагменты инцидентов, кольцевой буфер")
+      Container(metrics_agent, "Экспортёр метрик", "OpenTelemetry", "Метрики агента, свои метрики через плагины")
+  }
+
+  ' ============================================================
+  ' ЦЕНТРАЛЬНАЯ ПЛАТФОРМА - агрегация, без критического пути
+  ' ============================================================
+  System_Boundary(core, "Центральная платформа") {
+
+      Container(gateway, "API Gateway", "Kong / Spring Cloud Gateway", "Единая точка входа, проверка токенов, лимиты")
+      Container(web, "Веб-портал", "React", "Сводки по всем фермам")
+      Container(mobile, "Мобильное приложение", "Flutter", "Уведомления и просмотр инцидентов")
+
+      Container(herd, "Реестр поголовья", "Kotlin", "Учёт голов по всем фермам, приплод, падёж, перемещения")
+      Container(incidents, "История инцидентов", "Kotlin", "Агрегация инцидентов со всех ферм, разбор, статистика")
+      Container(fleet, "Управление парком", "Kotlin", "Реестр ферм, камер, кормушек, агентов. Конфигурации")
+      Container(modeldist, "Раздача ML-моделей", "Go", "Версионирование, канареечный раскат, откат")
+      Container(syncgw, "Шлюз синхронизации", "Go", "Приём пакетов от агентов, дедупликация, разрешение конфликтов")
+      Container(notify_core, "Оповещения центра", "Go", "Push и email для руководства и администраторов")
+
+      ContainerQueue(kafka, "Шина событий", "Apache Kafka", "Поток событий со всех ферм")
+      ContainerDb(coredb, "Мастер-БД", "PostgreSQL", "Фермы, устройства, пользователи, конфигурации")
+      ContainerDb(coreblob, "Архив видео", "MinIO (S3)", "Видеофрагменты инцидентов, долгое хранение")
+      Container(idp, "Keycloak", "Keycloak", "OAuth2/OIDC, роли, SSO")
+      Container(obs, "Наблюдаемость", "Prometheus + Grafana", "Метрики, дашборды, алерты инфраструктуры")
+  }
+
+  System_Ext(erp, "1С:Агро (ERP)", "Склад кормов")
+  System_Ext(dwh, "DWH + BI", "ClickHouse, Power BI")
+  System_Ext(mlrepo, "Модели партнёра", "HTTPS")
+
+  ' ===== КРИТИЧЕСКИЙ ПУТЬ: целиком внутри фермы, до 5 секунд =====
+  Rel(cameras, ingest, "Видеопоток", "RTSP")
+  Rel(ingest, inference, "Кадры", "shared memory / gRPC")
+  Rel(inference, mqtt, "События детекции", "AMQP")
+  Rel(mqtt, welfare, "События детекции", "AMQP")
+  Rel(welfare, notify, "Инцидент требует реакции", "AMQP")
+  Rel(notify, siren, "Включить тревогу", "реле")
+  Rel(notify, sms, "SMS дежурному", "AT-команды")
+  Rel(notify, operator, "Тревога за < 5 сек")
+  Rel(watchdog, siren, "Аварийная тревога при отказе агента", "реле")
+
+  ' ===== ЛОКАЛЬНАЯ РАБОТА =====
+  Rel(operator, localui, "Подтверждает тревоги", "HTTPS, локальная сеть")
+  Rel(vet, localui, "Ставит диагноз", "HTTPS, локальная сеть")
+  Rel(localui, localapi, "Запросы", "REST/WebSocket")
+  Rel(localapi, localdb, "Читает и пишет", "SQL")
+  Rel(localapi, localblob, "Отдаёт видеофрагменты", "S3")
+
+  ' ===== ОСТАЛЬНЫЕ СЕРВИСЫ АГЕНТА =====
+  Rel(inference, counter, "Кадры и треки", "gRPC")
+  Rel(counter, mqtt, "Результат подсчёта", "AMQP")
+  Rel(feeding, devadapter, "Команды кормления", "внутр. API")
+  Rel(wateragent, devadapter, "Опрос фильтров", "внутр. API")
+  Rel(devadapter, feeders, "Команды и телеметрия", "Modbus")
+  Rel(devadapter, water, "Телеметрия", "Modbus TCP")
+  Rel(welfare, localdb, "Сохраняет инциденты", "SQL")
+  Rel(inference, localblob, "Сохраняет видеофрагмент инцидента", "S3")
+  Rel(feeding, localdb, "Расход корма", "SQL")
+
+  ' ===== СИНХРОНИЗАЦИЯ (задержка до 10 минут допустима) =====
+  Rel(localdb, sync, "Читает outbox", "SQL")
+  Rel(sync, syncgw, "Отправляет накопленное", "HTTPS/mTLS, WiFi или 4G")
+  Rel(syncgw, kafka, "Публикует события ферм", "Kafka")
+  Rel(modeldist, sync, "Новая версия модели", "HTTPS")
+  Rel(metrics_agent, obs, "Метрики", "OTLP")
+
+  ' ===== ЦЕНТР =====
+  Rel(kafka, herd, "События подсчёта", "Kafka")
+  Rel(kafka, incidents, "Инциденты", "Kafka")
+  Rel(kafka, coreblob, "Видеофрагменты", "Kafka Connect + S3")
+  Rel(admin, gateway, "Настройка", "HTTPS")
+  Rel(director, web, "Сводки", "HTTPS")
+  Rel(operator, mobile, "Уведомления", "HTTPS")
+  Rel(web, gateway, "API", "REST")
+  Rel(mobile, gateway, "API", "REST")
+  Rel(gateway, herd, "Запросы", "REST")
+  Rel(gateway, incidents, "Запросы", "REST")
+  Rel(gateway, fleet, "Запросы", "REST")
+  Rel(gateway, idp, "Проверка токенов", "OIDC")
+  Rel(fleet, coredb, "Реестр устройств", "SQL")
+  Rel(herd, coredb, "Поголовье", "SQL")
+  Rel(incidents, coredb, "История", "SQL")
+  Rel(mlrepo, modeldist, "Новые модели", "HTTPS")
+  Rel(notify_core, mobile, "Push-уведомления", "FCM/APNs")
+  Rel(incidents, notify_core, "Важные события для руководства", "AMQP")
+  Rel(herd, erp, "Поголовье и списание корма", "REST API")
+  Rel(kafka, dwh, "Выгрузка в хранилище", "Kafka Connect")
+
+  @enduml
