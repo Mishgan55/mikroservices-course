@@ -1,0 +1,143 @@
+@startuml C4_Вариант2_Код
+title C4 - Вариант 2. Диаграмма кода: то же ядро, другие адаптеры и мультиарендность
+
+skinparam classAttributeIconSize 0
+skinparam linetype ortho
+
+package "Домен (ИДЕНТИЧЕН варианту 1)" #E8F4FD {
+
+    interface IncidentRule <<интерфейс>> {
+        + type(): IncidentType
+        + supports(event: DetectionEvent): Boolean
+        + evaluate(event: DetectionEvent, ctx: FarmContext): RuleVerdict
+    }
+
+    class FightRule <<правило>>
+    class CrushingRule <<правило>>
+    class IllnessRule <<правило>>
+    class LamenessRule <<правило, добавлен позже>> #D4F8D4
+
+    class RuleRegistry {
+        - rules: List<IncidentRule>
+        + findFor(event: DetectionEvent): List<IncidentRule>
+    }
+
+    class Incident <<корень агрегата>> {
+        - id: IncidentId
+        - type: IncidentType
+        - farmId: FarmId
+        - state: IncidentState
+        - modelVersion: String
+        + merge(event: DetectionEvent): void
+        + confirm(by: UserId): void
+    }
+
+    class IncidentAggregator <<доменный сервис>>
+    class EscalationPolicy <<доменный сервис>>
+}
+
+note as N1 #E8F4FD
+  Доменное ядро в обоих вариантах ОДИНАКОВОЕ.
+  Это не совпадение, а следствие гексагональной
+  архитектуры: домен не знает, где он исполняется -
+  на ферме или в центре.
+
+  Практический вывод для Task4: миграция с варианта 2
+  на вариант 1 (или наоборот) не требует переписывания
+  бизнес-логики, меняются только адаптеры и оркестрация.
+end note
+
+package "Специфика центра (НОВОЕ, на ферме не нужно)" #FFE0E0 {
+
+    class FarmContext <<контекст аренды>> {
+        - farmId: FarmId
+        - thresholdOverrides: Map<IncidentType, Confidence>
+        - dutyRoster: DutyRoster
+        - gatewayStatus: ConnectionStatus
+    }
+    note bottom of FarmContext
+        На агенте ферма одна и контекст
+        вырождается в константу.
+        В центре это полноценная сущность.
+    end note
+
+    class TenantResolver {
+        + resolve(event: DetectionEvent): FarmContext
+    }
+
+    class LateEventPolicy {
+        - maxActionableAge: Duration
+        + isActionable(event: DetectionEvent, now: Instant): Boolean
+    }
+    note bottom of LateEventPolicy
+        События приходят пачками из буфера
+        шлюза после восстановления связи.
+        Инцидент двухчасовой давности пишем
+        в историю, но сирену не включаем.
+    end note
+
+    class ConnectivityGuard {
+        + chooseChannel(ctx: FarmContext): NotificationChannel
+    }
+    note bottom of ConnectivityGuard
+        Шлюз офлайн - команда на сирену
+        не дойдёт. Переключаемся на SMS
+        через оператора связи.
+    end note
+
+    class TenantAwareIncidentRepository {
+        + save(incident: Incident, ctx: FarmContext): void
+        + findOpenByPen(penId: PenId, ctx: FarmContext): List<Incident>
+    }
+    note bottom of TenantAwareIncidentRepository
+        Каждый запрос обязан фильтровать
+        по farmId. Пропуск фильтра = утечка
+        данных между фермами (критично
+        для перспективы SaaS).
+    end note
+}
+
+package "Порты (те же)" #FFF4E0 {
+    interface IncidentRepository <<порт>>
+    interface NotificationPort <<порт>>
+    interface EvidencePort <<порт>>
+}
+
+package "Адаптеры (ДРУГИЕ)" #F0F0F0 {
+    class KafkaDetectionListener <<адаптер, вход>> {
+        + onRecord(record: ConsumerRecord): void
+    }
+    note bottom of KafkaDetectionListener
+        Вместо RabbitMQ - Kafka.
+        Ключ партиции = farmId, чтобы
+        события одной фермы шли по порядку.
+    end note
+    class KafkaNotificationAdapter <<адаптер>>
+    class MinioEvidenceAdapter <<адаптер>>
+    class JpaTenantRepository <<адаптер>>
+}
+
+IncidentRule <|.. FightRule
+IncidentRule <|.. CrushingRule
+IncidentRule <|.. IllnessRule
+IncidentRule <|.. LamenessRule
+RuleRegistry o-- IncidentRule
+IncidentAggregator --> Incident
+EscalationPolicy ..> Incident
+
+KafkaDetectionListener --> TenantResolver
+TenantResolver --> FarmContext
+TenantResolver --> LateEventPolicy
+LateEventPolicy --> RuleRegistry
+IncidentRule ..> FarmContext
+EscalationPolicy --> ConnectivityGuard
+ConnectivityGuard --> NotificationPort
+
+IncidentRepository <|.. TenantAwareIncidentRepository
+TenantAwareIncidentRepository <|.. JpaTenantRepository
+NotificationPort <|.. KafkaNotificationAdapter
+EvidencePort <|.. MinioEvidenceAdapter
+IncidentAggregator ..> IncidentRepository
+IncidentAggregator ..> EvidencePort
+
+@enduml

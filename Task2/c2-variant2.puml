@@ -1,0 +1,114 @@
+ @startuml C2_Вариант2
+!include https://raw.githubusercontent.com/plantuml-stdlib/C4-PlantUML/master/C4_Container.puml
+
+title C2 - Вариант 2: "Централизованная платформа, тонкий шлюз"
+
+Person(operator, "Оператор фермы", "Дежурный")
+Person(vet, "Ветеринарный врач", "Диагнозы")
+Person(admin, "Администратор", "Настройка ферм")
+Person(director, "Директор", "Сводки")
+
+System_Ext(cameras, "IP-камеры", "ONVIF/RTSP")
+System_Ext(feeders, "Кормушки и поилки", "Modbus и проприетарные протоколы")
+System_Ext(water, "Станции водоподготовки", "Modbus TCP")
+System_Ext(siren, "Сирена и табло", "Реле")
+System_Ext(sms, "GSM/SMS-шлюз", "SMPP")
+
+' ============================================================
+' ФЕРМЕННЫЙ ШЛЮЗ - тонкий, без GPU, без бизнес-логики
+' ============================================================
+System_Boundary(gw, "Ферменный шлюз (на каждой ферме, дешёвое железо)") {
+    Container(transcode, "Приём и транскодирование", "C + GStreamer", "RTSP от камер, сжатие H.265 для экономии канала")
+    Container(uplink, "Аплинк-агент", "Go", "Отправка видео и телеметрии в центр. Переключение WiFi <-> 4G")
+    Container(buffer, "Буфер обрыва связи", "SQLite + кольцевой файловый буфер", "Копит данные при отсутствии связи, ограничен объёмом диска")
+    Container(devadapter2, "Адаптер оборудования", "Go", "Modbus и проприетарные протоколы. Транслирует команды из центра")
+    Container(degraded, "Аварийный режим", "C", "Примитивные локальные правила при потере связи: датчик движения, порог температуры. БЕЗ видеоаналитики")
+}
+
+' ============================================================
+' ЦЕНТРАЛЬНАЯ ПЛАТФОРМА - здесь ВСЁ
+' ============================================================
+System_Boundary(core, "Центральная платформа (весь интеллект здесь)") {
+
+    Container(ingestgw, "Шлюз приёма потоков", "Go + WebRTC/SRT", "Принимает потоки со ВСЕХ ферм")
+    Container(inference2, "Кластер инференса", "Python + Triton, GPU-ферма", "Модели партнёра для всех ферм. Общий пул GPU")
+    Container(welfare2, "Сервис благополучия", "Kotlin", "Инциденты, правила, подавление ложных срабатываний")
+    Container(counter2, "Подсчёт поголовья", "Python", "Считает головы по кадрам со всех ферм")
+    Container(feeding2, "Сервис кормления", "Go", "Расписания и дозы для всех ферм")
+    Container(water2, "Сервис водоподготовки", "Go", "Мониторинг фильтров всех ферм")
+    Container(notify2, "Сервис оповещений", "Go", "Сирена, SMS, push. Команды уходят обратно на фермы")
+
+    Container(gateway2, "API Gateway", "Kong", "Единая точка входа")
+    Container(web2, "Веб-портал", "React", "Единственный интерфейс: интернет обязателен")
+    Container(mobile2, "Мобильное приложение", "Flutter", "Работает только при наличии связи")
+    Container(herd2, "Реестр поголовья", "Kotlin", "Учёт по всем фермам")
+    Container(fleet2, "Управление парком шлюзов", "Kotlin", "Реестр ферм и устройств. Проще, чем в варианте 1: шлюзы почти не обновляются")
+    Container(idp2, "Keycloak", "Keycloak", "OAuth2/OIDC")
+    Container(obs2, "Наблюдаемость", "Prometheus + Grafana", "Метрики")
+    ContainerDb(coredb2, "Мастер-БД", "PostgreSQL", "Фермы, устройства, пользователи")
+}
+
+' ===== ПЕРЕИСПОЛЬЗУЕМ СУЩЕСТВУЮЩУЮ ИНФРАСТРУКТУРУ КОМПАНИИ =====
+System_Boundary(corp, "Существующая корпоративная инфраструктура (переиспользуется)") {
+    ContainerQueue(kafka2, "Apache Kafka", "Kafka", "Уже есть в компании. Шина данных")
+    ContainerDb(minio2, "MinIO (Data Lake)", "MinIO", "Уже есть. Хранение видео и сырых данных")
+    ContainerDb(tsdb2, "TimescaleDB", "TimescaleDB", "Уже есть. Телеметрия датчиков")
+}
+
+System_Ext(erp2, "1С:Агро (ERP)", "Склад кормов")
+System_Ext(dwh2, "DWH + BI", "ClickHouse, Power BI")
+System_Ext(mlrepo2, "Модели партнёра", "HTTPS")
+
+' ===== КРИТИЧЕСКИЙ ПУТЬ: ДВАЖДЫ ПЕРЕСЕКАЕТ ИНТЕРНЕТ =====
+Rel(cameras, transcode, "Видеопоток", "RTSP")
+Rel(transcode, uplink, "Сжатый поток", "внутр.")
+Rel(uplink, ingestgw, "1. Поток уходит в центр", "WiFi/4G - УЗКОЕ МЕСТО")
+Rel(ingestgw, inference2, "2. Кадры на инференс", "gRPC")
+Rel(inference2, kafka2, "3. События детекции", "Kafka")
+Rel(kafka2, welfare2, "4. События детекции", "Kafka")
+Rel(welfare2, notify2, "5. Инцидент", "Kafka")
+Rel(notify2, uplink, "6. Команда обратно на ферму", "MQTT - ВТОРОЕ пересечение интернета")
+Rel(uplink, siren, "7. Включить сирену", "реле")
+Rel(notify2, sms, "SMS дежурному", "SMPP")
+Rel(notify2, operator, "Тревога: суммарная задержка зависит от канала")
+
+' ===== АВАРИЙНЫЙ РЕЖИМ ПРИ ОБРЫВЕ СВЯЗИ =====
+Rel(uplink, buffer, "Нет связи - копим", "SQLite")
+Rel(buffer, ingestgw, "Догоняем после восстановления", "HTTPS")
+Rel(degraded, siren, "Примитивная тревога без видеоаналитики", "реле")
+Rel(degraded, sms, "SMS дежурному", "AT-команды")
+
+' ===== УПРАВЛЕНИЕ ОБОРУДОВАНИЕМ - тоже через центр =====
+Rel(feeding2, uplink, "Команды кормления", "MQTT")
+Rel(uplink, devadapter2, "Транслирует", "внутр.")
+Rel(devadapter2, feeders, "Команды и телеметрия", "Modbus")
+Rel(devadapter2, water, "Телеметрия", "Modbus TCP")
+Rel(devadapter2, uplink, "Телеметрия наверх", "внутр.")
+
+' ===== ЛЮДИ: ВСЕ РАБОТАЮТ ТОЛЬКО ЧЕРЕЗ ЦЕНТР =====
+Rel(operator, mobile2, "Подтверждает тревоги", "HTTPS - нужен интернет")
+Rel(vet, web2, "Ставит диагноз", "HTTPS - нужен интернет")
+Rel(admin, web2, "Настройка", "HTTPS")
+Rel(director, web2, "Сводки", "HTTPS")
+Rel(web2, gateway2, "API", "REST")
+Rel(mobile2, gateway2, "API", "REST")
+Rel(gateway2, welfare2, "Запросы", "REST")
+Rel(gateway2, herd2, "Запросы", "REST")
+Rel(gateway2, fleet2, "Запросы", "REST")
+Rel(gateway2, idp2, "Проверка токенов", "OIDC")
+
+' ===== ХРАНЕНИЕ И ИНТЕГРАЦИИ =====
+Rel(inference2, minio2, "Видеофрагменты инцидентов", "S3")
+Rel(counter2, kafka2, "Результат подсчёта", "Kafka")
+Rel(kafka2, herd2, "События подсчёта", "Kafka")
+Rel(kafka2, tsdb2, "Телеметрия", "Kafka Connect")
+Rel(water2, tsdb2, "Показания фильтров", "SQL")
+Rel(welfare2, coredb2, "Инциденты", "SQL")
+Rel(herd2, coredb2, "Поголовье", "SQL")
+Rel(mlrepo2, inference2, "Модели обновляются В ОДНОМ МЕСТЕ", "HTTPS")
+Rel(fleet2, coredb2, "Реестр", "SQL")
+Rel(herd2, erp2, "Поголовье и списание корма", "REST API")
+Rel(kafka2, dwh2, "Выгрузка", "Kafka Connect")
+Rel(obs2, kafka2, "Метрики", "OTLP")
+
+@enduml

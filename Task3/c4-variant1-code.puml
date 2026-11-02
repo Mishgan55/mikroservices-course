@@ -1,0 +1,164 @@
+@startuml C4_Вариант1_Код
+title C4 - Вариант 1. Диаграмма кода: механизм расширяемости типов инцидентов
+
+skinparam classAttributeIconSize 0
+skinparam linetype ortho
+
+package "Домен (не зависит ни от чего)" #E8F4FD {
+
+    interface IncidentRule <<интерфейс>> {
+        + type(): IncidentType
+        + supports(event: DetectionEvent): Boolean
+        + evaluate(event: DetectionEvent, ctx: FarmContext): RuleVerdict
+    }
+    note right of IncidentRule
+        КЛЮЧЕВОЙ КОНТРАКТ.
+        Новый тип инцидента = новый класс,
+        реализующий этот интерфейс.
+        Существующий код НЕ меняется.
+        (принцип открытости/закрытости)
+    end note
+
+    class FightRule <<правило>> {
+        - threshold: Confidence
+        - minDurationMs: Long
+        + evaluate(...): RuleVerdict
+    }
+    class CrushingRule <<правило>> {
+        - threshold: Confidence
+        - pigletSizeRatio: Double
+        + evaluate(...): RuleVerdict
+    }
+    class IllnessRule <<правило>> {
+        - inactivityWindow: Duration
+        + evaluate(...): RuleVerdict
+    }
+    class LamenessRule <<правило, добавлен позже>> #D4F8D4 {
+        - gaitDeviation: Double
+        + evaluate(...): RuleVerdict
+    }
+    note bottom of LamenessRule
+        Добавлен через год.
+        Ни один существующий класс
+        не был изменён.
+    end note
+
+    class RuleRegistry {
+        - rules: List<IncidentRule>
+        + register(rule: IncidentRule): void
+        + findFor(event: DetectionEvent): List<IncidentRule>
+    }
+    note right of RuleRegistry
+        Правила подхватываются из
+        справочника типов инцидентов.
+        Включение и отключение типа -
+        настройка, а не релиз.
+    end note
+
+    class Incident <<корень агрегата>> {
+        - id: IncidentId
+        - type: IncidentType
+        - farmId: FarmId
+        - penId: PenId
+        - state: IncidentState
+        - confidence: Confidence
+        - detections: List<DetectionEvent>
+        - evidenceRef: EvidenceRef
+        - modelVersion: String
+        + merge(event: DetectionEvent): void
+        + confirm(by: UserId): void
+        + close(diagnosis: Diagnosis): void
+    }
+    note left of Incident
+        modelVersion хранится в инциденте.
+        Из-за офлайн-работы фермы могут
+        быть на разных версиях моделей -
+        при разборе видно, чем получен.
+    end note
+
+    enum IncidentState {
+        NEW
+        NOTIFIED
+        ACKNOWLEDGED
+        IN_PROGRESS
+        CLOSED
+        FALSE_POSITIVE
+    }
+
+    class DetectionEvent <<объект-значение>> {
+        - type: IncidentType
+        - confidence: Confidence
+        - penId: PenId
+        - cameraId: CameraId
+        - occurredAt: Instant
+        - modelVersion: String
+    }
+
+    class RuleVerdict <<объект-значение>> {
+        - matched: Boolean
+        - severity: Severity
+        - reason: String
+    }
+
+    class IncidentAggregator <<доменный сервис>> {
+        - window: Duration
+        + aggregate(verdict: RuleVerdict, event: DetectionEvent): Incident
+    }
+
+    class EscalationPolicy <<доменный сервис>> {
+        + resolveTargets(incident: Incident, at: Instant): List<NotificationTarget>
+    }
+}
+
+package "Порты (интерфейсы наружу)" #FFF4E0 {
+    interface IncidentRepository <<порт>> {
+        + save(incident: Incident): void
+        + findOpenByPen(penId: PenId): List<Incident>
+    }
+    interface NotificationPort <<порт>> {
+        + send(incident: Incident, targets: List<NotificationTarget>): void
+    }
+    interface EvidencePort <<порт>> {
+        + capture(cameraId: CameraId, at: Instant): EvidenceRef
+    }
+    interface OutboxPort <<порт>> {
+        + publish(event: DomainEvent): void
+    }
+}
+
+package "Адаптеры (зависят от инфраструктуры)" #F0F0F0 {
+    class JpaIncidentRepository <<адаптер>>
+    class RabbitNotificationAdapter <<адаптер>>
+    class MinioEvidenceAdapter <<адаптер>>
+    class PostgresOutboxAdapter <<адаптер>>
+    class DetectionEventListener <<адаптер, вход>> {
+        + onMessage(raw: ByteArray): void
+    }
+}
+
+IncidentRule <|.. FightRule
+IncidentRule <|.. CrushingRule
+IncidentRule <|.. IllnessRule
+IncidentRule <|.. LamenessRule
+
+RuleRegistry o-- IncidentRule
+RuleRegistry ..> DetectionEvent
+IncidentRule ..> RuleVerdict
+IncidentAggregator ..> RuleVerdict
+IncidentAggregator --> Incident
+Incident *-- IncidentState
+Incident *-- DetectionEvent
+EscalationPolicy ..> Incident
+
+IncidentRepository <|.. JpaIncidentRepository
+NotificationPort <|.. RabbitNotificationAdapter
+EvidencePort <|.. MinioEvidenceAdapter
+OutboxPort <|.. PostgresOutboxAdapter
+
+DetectionEventListener --> RuleRegistry
+IncidentAggregator ..> IncidentRepository
+IncidentAggregator ..> EvidencePort
+IncidentAggregator ..> OutboxPort
+EscalationPolicy ..> NotificationPort
+
+@enduml
